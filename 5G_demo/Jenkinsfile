@@ -1,0 +1,120 @@
+pipeline {
+    agent {
+      dockerfile {
+      args '-u root --privileged'}
+    }
+    environment {
+        ARTIFACTORY_URL = 'https://artifactory.dev.eficode.io/'
+        ARTIFACTORY_PATH = 'Telco_DevOps/vendor/product/8.0'
+    }
+    triggers {
+        bitbucketPush()
+        upstream(upstreamProjects: "5G_demo/artifactory-check", threshold: hudson.model.Result.SUCCESS)
+    }
+    stages {
+        stage('unit test') {
+            steps {
+                sh 'python -m unittest -b'
+            }
+        }
+        stage('deploy') {
+            stages {
+                stage('check resources') {
+                    steps {
+                        dir('scripts/openstack') {
+                            sh 'python check_resources.py ../openbaton/tutorial-iperf-NSR-floatingIPs.json'
+                        }
+                    }
+                    post {
+                        failure {
+                            echo 'TODO//PLACEHOLDER: Create error report to JIRA'
+                        }
+                    }
+                }
+                stage('import image') {
+                    steps {
+                        dir('scripts/openstack') {
+                            sh 'python image_import.py'
+                        }
+                    }
+                }
+                stage('deploy NSD') {
+                    environment {
+                        OPENBATON_ADMIN_CREDS = credentials('jenkins-openbaton-admin-creds')
+                    }
+                    steps {
+                        dir('scripts/openbaton') {
+                            sh 'python nsd_deployment.py --password ${OPENBATON_ADMIN_CREDS_PSW} tutorial-iperf-NSR-floatingIPs.json'
+                        }
+                    }
+                }
+            }
+        }
+        stage('test') {
+            environment {
+                ARTIFACTORY_CREDENTIALS = credentials('artifactory-credentials')
+            }
+            steps {
+                dir('tests/robot') {
+                    sh 'robot --nostatusrc --outputdir results -e failing .'
+                    sh 'zip -r results.zip results'
+                    script {
+                        SHA1 = sh([script: "sha1sum results.zip | awk '{ print \$1 }'", returnStdout: true]).trim()
+                        echo "SHA1 CHECKSUM: ${SHA1}"
+                    }
+                    sh "curl --fail -u ${ARTIFACTORY_CREDENTIALS} -T results.zip -H 'X-Checksum-Sha1:${SHA1}' '$ARTIFACTORY_URL$ARTIFACTORY_PATH/results.zip'"
+                    step([$class: 'RobotPublisher',
+                        outputPath: 'results',
+                        outputFileName: 'output.xml',
+                        reportFileName: 'report.html',
+                        logFileName: 'log.html',
+                        otherFiles: '',
+                        disableArchiveOutput: false,
+                        enableCache: true,
+                        unstableThreshold: 80,
+                        passThreshold: 95,
+                        onlyCritical: true
+                    ])
+                }
+            }
+            post {
+                success {
+                    setArtifactoryRepositoryTag("qa-passed")
+                }
+                failure {
+                    setArtifactoryRepositoryTag("qa-failed")
+                }
+                unstable {
+                    setArtifactoryRepositoryTag("qa-inconclusive")
+                }
+            }
+        }
+        stage('Create container deployment') {
+            steps {
+                dir('scripts/docker') {
+                    /*sh 'ssh-keygen -R 95.216.146.41'*/
+                    sh 'python create_container_deployment.py'
+                    }
+                }
+            }
+        stage('Scale deployment') {
+            steps {
+                dir('scripts/docker') {
+                    sh 'python scale_container_deployment.py'
+                    }
+                }
+            }
+        stage('Expose service') {
+            steps {
+                dir('scripts/docker') {
+                    sh 'python expose_deployment.py'
+                    }
+                }
+            }
+/*HERE SHOULD BE TESTS FOR THE CONTAINERS*/
+    }
+}
+
+void setArtifactoryRepositoryTag(String tag) {
+    sh "curl -u ${ARTIFACTORY_CREDENTIALS} -X PATCH -H 'Content-Type: application/json' -d '{\"props\": {\"verified\": \"${tag}\"}}' '${ARTIFACTORY_URL}api/metadata/${ARTIFACTORY_PATH}'"
+}
